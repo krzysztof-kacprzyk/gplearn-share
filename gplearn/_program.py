@@ -16,7 +16,22 @@ from sklearn.utils.random import sample_without_replacement
 
 from .functions import _Function
 from .utils import check_random_state
+from .functions import _function_map
 
+from functools import reduce
+
+from .model import Model, LitModel
+
+import pytorch_lightning as pl
+
+
+import torch
+
+import time
+
+from datetime import datetime
+
+import matplotlib.pyplot as plt
 
 class _Program(object):
 
@@ -89,6 +104,10 @@ class _Program(object):
     program : list, optional (default=None)
         The flattened tree representation of the program. If None, a new naive
         random tree will be grown. If provided, it will be validated.
+    
+    function_probs : list, optional (default=None)
+        The probabilities of choosing functions during program generation.
+        The numbers in the list should sum up to 1.
 
     Attributes
     ----------
@@ -133,7 +152,10 @@ class _Program(object):
                  random_state,
                  transformer=None,
                  feature_names=None,
-                 program=None):
+                 program=None,
+                 function_probs=None,
+                 optim_dict=None,
+                 timestamp="unknown"):
 
         self.function_set = function_set
         self.arities = arities
@@ -147,14 +169,35 @@ class _Program(object):
         self.transformer = transformer
         self.feature_names = feature_names
         self.program = program
+        self.function_probs = function_probs
+        self.model = None
+        self.optim_dict = optim_dict
+        self.timestamp = timestamp
+
+        if self.function_probs is None:
+            # Uniform distribution over all functions
+            self.function_probs = np.ones(len(self.function_set)) / len(self.function_set)
+
+        operator_indices = [i for i, fun in enumerate(self.function_set) if fun.name != 'shape']
+        self.operator_set = [self.function_set[i] for i in operator_indices]
+        self.operator_probs = self.function_probs[operator_indices]
+        self.operator_probs /= np.sum(self.operator_probs)
 
         if self.program is not None:
             if not self.validate_program():
                 raise ValueError('The supplied program is incomplete.')
         else:
             # Create a naive random program
-            self.program = self.build_program(random_state)
+            n_active_variables = self.random_skewed_integer(random_state,1,self.n_features+1)
+            active_variables = set(random_state.choice(list(range(self.n_features)),size=n_active_variables,replace=False))
+            self.program = self.build_program(random_state,variables=active_variables)
+        
+        if not self.validate_unique_leaves():
+            print(self.program)
+            raise ValueError('The supplied program does not have unique leaves')
 
+        self.active_variables = self.find_active_variables()
+        
         self.raw_fitness_ = None
         self.fitness_ = None
         self.parents = None
@@ -162,13 +205,63 @@ class _Program(object):
         self._max_samples = None
         self._indices_state = None
 
-    def build_program(self, random_state):
+    def random_function(self, random_state, only_operators=False):
+        if not only_operators:
+            return random_state.choice(self.function_set,replace=True,p=self.function_probs)
+        else:
+            return random_state.choice(self.operator_set,replace=True,p=self.operator_probs)
+    
+    def is_shape_function(self, function):
+        if isinstance(function, _Function):
+            if function.name == 'shape':
+                return True
+            else:
+                return False
+        else:
+            return False
+
+    def find_active_variables(self, program=None):
+        if program is None:
+            program = self.program
+        active_variables = set()
+        for node in program:
+            if isinstance(node, int):
+                active_variables.add(node)
+        
+        return active_variables
+
+    def validate_unique_leaves(self):
+        active_variables = set()
+        for node in self.program:
+            if isinstance(node, int):
+                if node in active_variables:
+                    return False
+                active_variables.add(node)
+        
+        return True
+
+    def is_fitting_necessary(self, categorical_variables):
+        return self.any_shapes() or self.any_categorical_variables(categorical_variables)
+    
+    def random_skewed_integer(self, random_state, low, high):
+        # low - inclusive, high - exclusive
+        ps = np.array(list(range(1,high-low+1)))
+        ps = ps / ps.sum()
+        return random_state.choice(list(range(low,high)),p=ps)
+
+
+
+    def build_program(self, random_state, variables=None):
         """Build a naive random program.
 
         Parameters
         ----------
         random_state : RandomState instance
             The random number generator.
+        
+        variables: set
+            Set of integers corresponding to available variables.
+            If None then all variables are considered
 
         Returns
         -------
@@ -176,51 +269,125 @@ class _Program(object):
             The flattened tree representation of the program.
 
         """
+        if variables is None:
+            variables = set([int(i) for i in range(self.n_features)])
+
         if self.init_method == 'half and half':
             method = ('full' if random_state.randint(2) else 'grow')
         else:
             method = self.init_method
-        max_depth = random_state.randint(*self.init_depth)
+
+        # max_depth = random_state.randint(*self.init_depth)
 
         # Start a program with a function to avoid degenerative programs
-        function = random_state.randint(len(self.function_set))
-        function = self.function_set[function]
+        if len(variables) > 1:
+            function = self.random_function(random_state)
+        else:
+            function = _function_map['shape']
         program = [function]
         terminal_stack = [function.arity]
 
+        n_planned_variables = function.arity
+
         while terminal_stack:
-            depth = len(terminal_stack)
-            choice = self.n_features + len(self.function_set)
-            choice = random_state.randint(choice)
-            # Determine if we are adding a function or terminal
-            if (depth < max_depth) and (method == 'full' or
-                                        choice <= len(self.function_set)):
-                function = random_state.randint(len(self.function_set))
-                function = self.function_set[function]
-                program.append(function)
-                terminal_stack.append(function.arity)
-            else:
-                # We need a terminal, add a variable or constant
-                if self.const_range is not None:
-                    terminal = random_state.randint(self.n_features + 1)
+            possibilities = []
+            if not self.is_shape_function(program[-1]):
+                # You can choose a shape function as the previous element was not a shape function
+                possibilities.append('shape')
+              
+            if n_planned_variables < len(variables):
+                # You can choose a binary operator as there are still some variables unaccounted for
+                possibilities.append('operator')
+            
+            if (n_planned_variables > 1) or (len(variables) == 1):
+                # You can choose a variable as this would not prevent other variables from being chosen in the future
+                possibilities.append('variable')
+            
+            if method == 'full': # If the method is 'full' then we choose functions as long as we can
+
+                # If the variable is the only option then choose variable
+                if (len(possibilities) == 1) and ('variable' in possibilities):
+                    node = int(random_state.choice(list(variables)))
+                else: # If a function is possible then we choose a function
+                    if ('shape' in possibilities) and ('operator' in possibilities):
+                        node = self.random_function(random_state)
+                    elif 'operator' in possibilities:
+                        node = self.random_function(random_state, only_operators=True)
+                    elif 'shape' in possibilities:
+                        node = _function_map['shape']
+                    else:
+                        print(possibilities)
+                        raise ValueError("That is weird. We should never get here")
+
+            elif method == 'grow': # If the method is 'grow' then we can choose a leaf earlier
+                node_name = random_state.choice(possibilities) # This is uniform, may be changed later TODO:
+                if node_name in ['shape','operator']:
+                    if 'operator' in possibilities:
+                        node = self.random_function(random_state, only_operators=(not ('shape' in possibilities)))
+                    elif 'shape' in possibilities:
+                        node = _function_map['shape']
+                    else:
+                        print(possibilities)
+                        print(node_name)
+                        print(program)
+                        raise ValueError("That is weird. We should never get here")
                 else:
-                    terminal = random_state.randint(self.n_features)
-                if terminal == self.n_features:
-                    terminal = random_state.uniform(*self.const_range)
-                    if self.const_range is None:
-                        # We should never get here
-                        raise ValueError('A constant was produced with '
-                                         'const_range=None.')
-                program.append(terminal)
+                    node = int(random_state.choice(list(variables)))
+
+            if isinstance(node, _Function):
+                # The next node is a function
+                program.append(node)
+                terminal_stack.append(node.arity)
+                n_planned_variables += (node.arity - 1)
+            else: # it is a variable as we exclude numeric constants
+                node = int(node)
+                program.append(node)
+                variables.remove(node)
+                n_planned_variables -= 1 # as the plan was executed
+
                 terminal_stack[-1] -= 1
                 while terminal_stack[-1] == 0:
                     terminal_stack.pop()
                     if not terminal_stack:
                         return program
                     terminal_stack[-1] -= 1
-
+        
         # We should never get here
-        return None
+        raise ValueError("That is weird. We should never get here")
+
+        # while terminal_stack:
+        #     depth = len(terminal_stack)
+        #     choice = self.n_features + len(self.function_set)
+        #     choice = random_state.randint(choice)
+        #     # Determine if we are adding a function or terminal
+        #     if (depth < max_depth) and (method == 'full' or
+        #                                 choice <= len(self.function_set)):
+        #         function = random_state.randint(len(self.function_set))
+        #         function = self.function_set[function]
+        #         program.append(function)
+        #         terminal_stack.append(function.arity)
+        #     else:
+        #         # We need a terminal, add a variable or constant
+        #         if self.const_range is not None:
+        #             terminal = random_state.randint(self.n_features + 1)
+        #         else:
+        #             terminal = random_state.randint(self.n_features)
+        #         if terminal == self.n_features:
+        #             terminal = random_state.uniform(*self.const_range)
+        #             if self.const_range is None:
+        #                 # We should never get here
+        #                 raise ValueError('A constant was produced with '
+        #                                  'const_range=None.')
+        #         program.append(terminal)
+        #         terminal_stack[-1] -= 1
+        #         while terminal_stack[-1] == 0:
+        #             terminal_stack.pop()
+        #             if not terminal_stack:
+        #                 return program
+        #             terminal_stack[-1] -= 1
+
+        # # We should never get here
+        # return None
 
     def validate_program(self):
         """Rough check that the embedded program in the object is valid."""
@@ -259,6 +426,139 @@ class _Program(object):
                 if i != len(self.program) - 1:
                     output += ', '
         return output
+
+   
+
+
+    def get_argument_ranges_for_shape_functions(self, numerical_arguments, categorical_arguments):
+        """
+        numerical_arguments is a dictionary variable: (lower_bound, upper_bound)
+        categorical_arguments is a dictionary: [categorical_value_1, ...]
+        """
+
+        if self.is_fitting_necessary(categorical_arguments.keys()):
+            if self.model is None:
+                raise ValueError("The equation was not fitted. Call raw_fitness function")
+        else:
+            print("No shape functions to plot")
+            return
+
+        
+        program = self.model.program_list # this one contains the shape functions before categorical variables
+
+        # No need to deal with single node as the model requires fitting, so it has at least two nodes
+
+        def get_variable_range(variable):
+            if variable in numerical_arguments:
+                return numerical_arguments[variable]
+            elif variable in categorical_arguments:
+                return variable
+            else:
+                raise ValueError("Not all ranges are provided")
+        
+        def get_operator_range(fun, argument_ranges):
+            division_threshold = 1e-3
+
+            if fun.arity == 2:
+                a = argument_ranges[0][0]
+                b = argument_ranges[0][1]
+                c = argument_ranges[1][0]
+                d = argument_ranges[1][1]
+
+                if fun.name == 'add':
+                    return (a+c,b+d)
+                elif fun.name == 'sub':
+                    return (a-d,b-c)
+                elif fun.name == 'mul':
+                    return (min([a*c,a*d,b*c,b*d]), max([a*c,a*d,b*c,b*d]))
+                elif fun.name == 'div':
+                    zero_possible = False
+                    # intersect with (division_threshold, +inf)
+                    if argument_ranges[1][1] < division_threshold:
+                        return (0.0,0.0)
+                    elif argument_ranges[1][0] < division_threshold:
+                        new_range = (division_threshold,argument_ranges[1][1])
+                        zero_possible = True
+                    else:
+                        new_range = argument_ranges[1]
+                    c = new_range[0]
+                    d = new_range[1]
+                    if zero_possible:
+                        return (min([a/c,a/d,b/c,b/d,0]),max([a/c,a/d,b/c,b/d,0]))
+                    else:
+                        return (min([a/c,a/d,b/c,b/d]),max([a/c,a/d,b/c,b/d]))
+
+        def get_shape_range(shape_index, argument_range, steps=10000):
+            shape_function = self.model.shape_functions[shape_index]
+
+            shape_function.to(torch.device('cpu'))
+
+            t = torch.linspace(argument_range[0],argument_range[1],steps)
+            
+            pred = shape_function(t)
+            lower = torch.min(pred).item()
+            upper = torch.max(pred).item()
+
+            return (lower,upper)
+
+        def get_categorical_range(categorical_variable):
+            weights = self.model.cat_shape_functions[str(categorical_variable)]
+            lower = torch.min(weights)
+            upper = torch.max(weights)
+            return (lower,upper)
+
+        stack = []
+
+        shape_counter = 0
+        shape_ranges = {}
+
+
+        for node in program:
+            if isinstance(node, _Function):
+                if node.name == 'shape':
+                    stack.append([(shape_counter,node)])
+                    shape_counter += 1
+                else:
+                    stack.append([(-1,node)])
+            else: # it's a variable 
+                stack[-1].append(get_variable_range(node))
+
+            while stack[-1][0][1].arity == len(stack[-1][1:]):
+                f = stack[-1][0][1]
+                index = stack[-1][0][0]
+                if f.name == 'shape':
+                    if not isinstance(stack[-1][1],tuple):
+                        intermediate_range = get_categorical_range(stack[-1][1])
+                    else:
+                        intermediate_range = get_shape_range(index,stack[-1][1])
+                        shape_ranges[index] = stack[-1][1]
+                else:
+                    intermediate_range = get_operator_range(f,stack[-1][1:])
+                
+                if len(stack) != 1:
+                    stack.pop()
+                    stack[-1].append(intermediate_range)
+                else:
+                    print(shape_ranges)
+                    return shape_ranges
+
+    
+    def plot_shape_functions(self, numerical_arguments, categorical_arguments, steps=1000):
+
+        shape_arg_ranges = self.get_argument_ranges_for_shape_functions(numerical_arguments, categorical_arguments)
+
+        shapes = self.model.shape_functions
+
+        for i, shape in enumerate(shapes):
+            t = torch.linspace(shape_arg_ranges[i][0],shape_arg_ranges[i][1],steps)
+            shape.to(torch.device('cpu'))
+            with torch.no_grad():
+                y = shape(t).flatten()
+                plt.plot(t.numpy(),y.numpy())
+                plt.show()
+
+
+
 
     def export_graphviz(self, fade_nodes=None):
         """Returns a string, Graphviz script for visualizing the program.
@@ -339,7 +639,7 @@ class _Program(object):
         """Calculates the number of functions and terminals in the program."""
         return len(self.program)
 
-    def execute(self, X):
+    def execute(self, X, ohe_matrices={}):
         """Execute the program according to X.
 
         Parameters
@@ -354,38 +654,55 @@ class _Program(object):
             The result of executing the program on X.
 
         """
-        # Check for single-node programs
-        node = self.program[0]
-        if isinstance(node, float):
-            return np.repeat(node, X.shape[0])
-        if isinstance(node, int):
-            return X[:, node]
+        if self.is_fitting_necessary(ohe_matrices.keys()) :
+            if self.model is None:
+                raise ValueError("The model was not trained")
 
-        apply_stack = []
+            dataset = torch.utils.data.TensorDataset(X,*[ohe_matrices[k] for k in self.keys])
+            pred_dataloader = torch.utils.data.DataLoader(dataset, batch_size=self.optim_dict['batch_size'], shuffle=False, num_workers=self.optim_dict['num_workers_dataloader'])
+            
+            accelerator = "gpu" if self.optim_dict['device'] == 'cuda' else 'cpu'
 
-        for node in self.program:
+            trainer = pl.Trainer(deterministic=True,devices=1,accelerator=accelerator)
+            
+            y_pred = torch.concat(trainer.predict(self.model, pred_dataloader)).cpu().numpy()
 
-            if isinstance(node, _Function):
-                apply_stack.append([node])
-            else:
-                # Lazily evaluate later
-                apply_stack[-1].append(node)
+            # y_pred = self.model.predict(X,ohe_matrices,device=self.optim_dict['device']).cpu().detach().numpy()
+            return y_pred
+        else:
+            X = X.cpu().detach().numpy()
+            # Check for single-node programs
+            node = self.program[0]
+            if isinstance(node, float):
+                return np.repeat(node, X.shape[0])
+            if isinstance(node, int):
+                return X[:, node]
 
-            while len(apply_stack[-1]) == apply_stack[-1][0].arity + 1:
-                # Apply functions that have sufficient arguments
-                function = apply_stack[-1][0]
-                terminals = [np.repeat(t, X.shape[0]) if isinstance(t, float)
-                             else X[:, t] if isinstance(t, int)
-                             else t for t in apply_stack[-1][1:]]
-                intermediate_result = function(*terminals)
-                if len(apply_stack) != 1:
-                    apply_stack.pop()
-                    apply_stack[-1].append(intermediate_result)
+            apply_stack = []
+
+            for node in self.program:
+
+                if isinstance(node, _Function):
+                    apply_stack.append([node])
                 else:
-                    return intermediate_result
+                    # Lazily evaluate later
+                    apply_stack[-1].append(node)
 
-        # We should never get here
-        return None
+                while len(apply_stack[-1]) == apply_stack[-1][0].arity + 1:
+                    # Apply functions that have sufficient arguments
+                    function = apply_stack[-1][0]
+                    terminals = [np.repeat(t, X.shape[0]) if isinstance(t, float)
+                                else X[:, t] if isinstance(t, int)
+                                else t for t in apply_stack[-1][1:]]
+                    intermediate_result = function(*terminals)
+                    if len(apply_stack) != 1:
+                        apply_stack.pop()
+                        apply_stack[-1].append(intermediate_result)
+                    else:
+                        return intermediate_result
+
+            # We should never get here
+            return None
 
     def get_all_indices(self, n_samples=None, max_samples=None,
                         random_state=None):
@@ -438,7 +755,21 @@ class _Program(object):
         """Get the indices used to measure the program's fitness."""
         return self.get_all_indices()[0]
 
-    def raw_fitness(self, X, y, sample_weight):
+    def any_shapes(self):
+        for node in self.program:
+            if isinstance(node, _Function):
+                if node.name == 'shape':
+                    return True
+        return False
+
+    def any_categorical_variables(self, categorical_variables):
+        for node in self.program:
+            if isinstance(node, int):
+                if node in categorical_variables:
+                    return True
+        return False
+
+    def raw_fitness(self, X, y, sample_weight, ohe_matrices={}):
         """Evaluate the raw fitness of the program according to X, y.
 
         Parameters
@@ -459,10 +790,81 @@ class _Program(object):
             The raw fitness of the program.
 
         """
-        y_pred = self.execute(X)
+        if not self.is_fitting_necessary(ohe_matrices.keys()):
+            y_pred = self.execute(X)
+        else: # You need to do training
+            
+            # model = Model(self,self.optim_dict,seed=0)
+
+            # model.train(X,y,ohe_matrices,device=self.optim_dict['device'])
+            # # t1 = time.time()
+            # y_pred = model.predict(X,ohe_matrices,device=self.optim_dict['device']).cpu().detach().numpy()
+            # # t2 = time.time()
+            # # print(f"Whole predicting: {t2-t1}")
+
+            self.keys = sorted(ohe_matrices.keys())
+            self.categorical_variables_dict = {k:ohe_matrices[k].shape[1] for k in self.keys}
+
+            model = LitModel(self,seed=0)
+
+            dataset = torch.utils.data.TensorDataset(X,*[ohe_matrices[k] for k in self.keys],y)
+
+            train_size = int(0.8 * len(dataset))
+            val_size = len(dataset) - train_size
+
+            gen = torch.Generator()
+            gen.manual_seed(self.optim_dict['seed'])
+
+            # Use random_split to divide the dataset
+            train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size], generator=gen)
+
+           
+
+            train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=self.optim_dict['batch_size'], shuffle=True, num_workers=self.optim_dict['num_workers_dataloader'],generator=gen)
+            val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=self.optim_dict['batch_size'], shuffle=False, num_workers=self.optim_dict['num_workers_dataloader'],generator=gen)
+            
+            accelerator = "gpu" if self.optim_dict['device'] == 'cuda' else 'cpu'
+
+            # torch.set_float32_matmul_precision("medium")
+            early_stopping = pl.callbacks.EarlyStopping('val_loss',patience=10,min_delta=self.optim_dict['tol'])
+            lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='epoch')
+            checkpoint_callback = pl.callbacks.ModelCheckpoint(
+                                monitor='val_loss',
+                                dirpath=f'checkpoints/{self.timestamp}',
+                                filename=f'{str(self)}-best_val_loss',
+                                save_top_k=1,
+                                mode='min',
+                                auto_insert_metric_name=True)
+
+
+            logger = pl.loggers.TensorBoardLogger("tb_logs", name=f"{self.timestamp}/{str(self)}")
+            
+            trainer = pl.Trainer(default_root_dir='./lightning_logs',logger=logger,deterministic=True,devices=1,check_val_every_n_epoch=10,callbacks=[early_stopping,lr_monitor,checkpoint_callback],auto_lr_find=True,enable_model_summary = False,enable_progress_bar=False,log_every_n_steps=10,auto_scale_batch_size=False,accelerator=accelerator,max_epochs=self.optim_dict['max_n_epochs'])
+            
+            trainer.tune(model,train_dataloaders=train_dataloader)
+            
+            trainer.fit(model=model,train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
+
+            # Load the best model
+            model = LitModel.load_from_checkpoint(f"checkpoints/{self.timestamp}/{str(self)}-best_val_loss.ckpt", program=self)
+
+            self.model = model
+
+            # val_loss = trainer.callback_metrics['val_loss'].item()
+            # print(f"val loss: {val_loss}")
+
+            pred_dataloader = torch.utils.data.DataLoader(dataset, batch_size=self.optim_dict['batch_size'], shuffle=False, num_workers=self.optim_dict['num_workers_dataloader'])
+
+            y_pred = torch.concat(trainer.predict(model, pred_dataloader)).cpu().numpy()
+      
+            
+            # return val_loss
+
         if self.transformer:
             y_pred = self.transformer(y_pred)
-        raw_fitness = self.metric(y, y_pred, sample_weight)
+
+        raw_fitness = self.metric(y.cpu().numpy(), y_pred, sample_weight)
+        print(f"{self} | raw_fitness: {raw_fitness}")
 
         return raw_fitness
 
@@ -486,7 +888,53 @@ class _Program(object):
         penalty = parsimony_coefficient * len(self.program) * self.metric.sign
         return self.raw_fitness_ - penalty
 
-    def get_subtree(self, random_state, program=None):
+    def get_possible_subtree_roots(self, variables, program=None):
+        if program is None:
+            program = self.program
+
+        # deal with a program with a single node
+        node = program[0]
+        if isinstance(node, int):
+            if node in variables:
+                return [(0,'leaf')]
+            else:
+                return []
+
+        # each element of stack is a tuple (a,b,c) where a is the index in program, b is the arity, c is a list of sets of active variables      stack = []
+        
+        stack = []
+        subtrees = []
+
+        for index, node in enumerate(program):
+
+            if isinstance(node, _Function):
+                stack.append((index, node.arity, []))
+            else: # it's a variable
+                stack[-1][2].append({node})
+                if node in variables:
+                    subtrees.append((index, 'leaf'))
+
+            while len(stack[-1][2]) == stack[-1][1]:
+                active_variables = reduce(lambda x, y: x.union(y), stack[-1][2])
+                if active_variables.issubset(variables):
+                        start = stack[-1][0]
+                        if stack[-1][1] == 1:
+                            function_type = 'single'
+                        else:
+                            function_type = 'operator'
+                        subtrees.append((start,function_type))
+                
+                if len(stack) != 1:
+                    stack.pop()
+                    stack[-1][2].append(active_variables)
+                else:
+                    return subtrees
+        
+        # We should never get here
+        return None 
+
+
+    def get_subtree(self, random_state, program=None, variables=None):
         """Get a random subtree from the program.
 
         Parameters
@@ -506,12 +954,23 @@ class _Program(object):
         """
         if program is None:
             program = self.program
-        # Choice of crossover points follows Koza's (1992) widely used approach
-        # of choosing functions 90% of the time and leaves 10% of the time.
-        probs = np.array([0.9 if isinstance(node, _Function) else 0.1
-                          for node in program])
-        probs = np.cumsum(probs / probs.sum())
-        start = np.searchsorted(probs, random_state.uniform())
+
+        if variables == None:
+            # Choice of crossover points follows Koza's (1992) widely used approach
+            # of choosing functions 90% of the time and leaves 10% of the time.
+            probs = np.array([0.9 if isinstance(node, _Function) else 0.1
+                            for node in program])
+            probs = np.cumsum(probs / probs.sum())
+            start = np.searchsorted(probs, random_state.uniform())
+        else:
+            possible_roots = self.get_possible_subtree_roots(variables,program=program)
+            if len(possible_roots) == 0:
+                return None
+            probs = np.array([0.1 if root[1] == 'leaf' else 0.9
+                            for root in possible_roots])
+            probs = np.cumsum(probs / probs.sum())
+            start_raw = np.searchsorted(probs, random_state.uniform())
+            start = possible_roots[start_raw][0]
 
         stack = 1
         end = start
@@ -551,8 +1010,23 @@ class _Program(object):
         # Get a subtree to replace
         start, end = self.get_subtree(random_state)
         removed = range(start, end)
+        active_variables_whole = self.find_active_variables()
+        active_variables_removed = self.find_active_variables(self.program[start:end])
+        all_possible_variables = set(range(self.n_features))
+        active_variables_left = (active_variables_whole - active_variables_removed)
+        active_variables_possible = all_possible_variables - active_variables_left
         # Get a subtree to donate
-        donor_start, donor_end = self.get_subtree(random_state, donor)
+        result = self.get_subtree(random_state, donor, active_variables_possible)
+        if result is not None:
+            donor_start, donor_end = result
+        else:
+            return self.program, [], []
+    
+        # Check if there is a redundant shape function
+        if start != 0:
+            if self.is_shape_function(self.program[start-1]) and self.is_shape_function(donor[donor_start]):
+                donor_start += 1
+        
         donor_removed = list(set(range(len(donor))) -
                              set(range(donor_start, donor_end)))
         # Insert genetic material from donor
@@ -581,10 +1055,29 @@ class _Program(object):
             The flattened tree representation of the program.
 
         """
+        start, end = self.get_subtree(random_state)
+        removed = range(start, end)
+        active_variables_whole = self.find_active_variables()
+        active_variables_removed = self.find_active_variables(self.program[start:end])
+        all_possible_variables = set(range(self.n_features))
+        active_variables_left = (active_variables_whole - active_variables_removed)
+        active_variables_possible = all_possible_variables - active_variables_left
+
+        num_of_variables = self.random_skewed_integer(random_state,1,len(active_variables_possible)+1)
+        chosen_active_variables = set(random_state.choice(list(active_variables_possible),size=num_of_variables,replace=False))
+
         # Build a new naive program
-        chicken = self.build_program(random_state)
-        # Do subtree mutation via the headless chicken method!
-        return self.crossover(chicken, random_state)
+        chicken = self.build_program(random_state, variables=chosen_active_variables)
+        
+        donor_start = 0
+        if start != 0:
+            if self.is_shape_function(chicken[0]) and self.is_shape_function(self.program[start-1]):
+                donor_start = 1
+        
+        return (self.program[:start] + chicken[donor_start:] + self.program[end:]), removed, range(donor_start,len(chicken))
+
+        # # Do subtree mutation via the headless chicken method!
+        # return self.crossover(chicken, random_state)
 
     def hoist_mutation(self, random_state):
         """Perform the hoist mutation operation on the program.
@@ -637,9 +1130,22 @@ class _Program(object):
         """
         program = copy(self.program)
 
+
+
         # Get the nodes to modify
         mutate = np.where(random_state.uniform(size=len(program)) <
                           self.p_point_replace)[0]
+
+        all_possible_variables = set([int(i) for i in range(self.n_features)])
+        active_variables = self.find_active_variables()
+        not_active_variables = all_possible_variables - active_variables
+       
+
+        # Add variables to be mutated
+        for node in mutate:
+            if isinstance(program[node], int):
+                not_active_variables.add(program[node])
+        
 
         for node in mutate:
             if isinstance(program[node], _Function):
@@ -650,18 +1156,33 @@ class _Program(object):
                 replacement = self.arities[arity][replacement]
                 program[node] = replacement
             else:
-                # We've got a terminal, add a const or variable
-                if self.const_range is not None:
-                    terminal = random_state.randint(self.n_features + 1)
-                else:
-                    terminal = random_state.randint(self.n_features)
-                if terminal == self.n_features:
-                    terminal = random_state.uniform(*self.const_range)
-                    if self.const_range is None:
-                        # We should never get here
-                        raise ValueError('A constant was produced with '
-                                         'const_range=None.')
+                terminal = int(random_state.choice(list(not_active_variables)))
                 program[node] = terminal
+                not_active_variables.remove(terminal)
+
+    
+
+        # for node in mutate:
+        #     if isinstance(program[node], _Function):
+        #         arity = program[node].arity
+        #         # Find a valid replacement with same arity
+        #         replacement = len(self.arities[arity])
+        #         replacement = random_state.randint(replacement)
+        #         replacement = self.arities[arity][replacement]
+        #         program[node] = replacement
+        #     else:
+        #         # We've got a terminal, add a const or variable
+        #         if self.const_range is not None:
+        #             terminal = random_state.randint(self.n_features + 1)
+        #         else:
+        #             terminal = random_state.randint(self.n_features)
+        #         if terminal == self.n_features:
+        #             terminal = random_state.uniform(*self.const_range)
+        #             if self.const_range is None:
+        #                 # We should never get here
+        #                 raise ValueError('A constant was produced with '
+        #                                  'const_range=None.')
+        #         program[node] = terminal
 
         return program, list(mutate)
 

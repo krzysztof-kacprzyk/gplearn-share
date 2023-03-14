@@ -20,9 +20,11 @@ from scipy.stats import rankdata
 from sklearn.base import BaseEstimator
 from sklearn.base import RegressorMixin, TransformerMixin, ClassifierMixin
 from sklearn.exceptions import NotFittedError
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.utils import compute_sample_weight
 from sklearn.utils.validation import check_array, _check_sample_weight
 from sklearn.utils.multiclass import check_classification_targets
+import torch
 
 from ._program import _Program
 from .fitness import _fitness_map, _Fitness
@@ -30,12 +32,64 @@ from .functions import _function_map, _Function, sig1 as sigmoid
 from .utils import _partition_estimators
 from .utils import check_random_state
 
+from multiprocessing import Manager
+
+from datetime import datetime
+
 __all__ = ['SymbolicRegressor', 'SymbolicClassifier', 'SymbolicTransformer']
 
 MAX_INT = np.iinfo(np.int32).max
 
+def _transform(program_list, categorical_variables):
 
-def _parallel_evolve(n_programs, parents, X, y, sample_weight, seeds, params):
+    shape_function = _function_map['shape']
+
+    cat_indices = []
+
+    for i, node in enumerate(program_list):
+        if isinstance(node,int):
+            if node in categorical_variables:
+                if i > 0:
+                    prev_node = program_list[i-1]
+                    if not isinstance(prev_node, _Function):
+                        cat_indices.append(i)
+                    else:
+                        if prev_node.name != 'shape':
+                            cat_indices.append(i)
+                else:
+                    cat_indices.append(i)
+    
+    shift = 0
+    for ind in cat_indices:
+        program_list.insert(ind+shift,shape_function)
+        shift += 1       
+    
+    # for node in self.program:
+    #     if isinstance(node,_Function):
+    #         print(node.name)
+    #     else:
+    #         print(node)
+    return [n.name if isinstance(n,_Function) else n for n in program_list]
+
+def check_cached_results(cached_results, program, categorical_variables):
+    program_list = program.program
+    new_program_list = _transform(program_list, categorical_variables)
+    hashable = tuple(new_program_list)
+    result = None
+    if hashable in cached_results:
+        result = cached_results[hashable]
+    return result
+        
+def save_to_cached_results(cached_results, program, categorical_variables, score):
+    program_list = program.program
+    new_program_list = _transform(program_list, categorical_variables)
+    hashable = tuple(new_program_list)
+    cached_results[hashable] = score
+    print(len(cached_results))
+    # print(id(cached_results))
+        
+
+def _parallel_evolve(n_programs, parents, X, y, sample_weight, seeds, params, cached_results):
     """Private function used to build a batch of programs within a job."""
     n_samples, n_features = X.shape
     # Unpack parameters
@@ -52,6 +106,9 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight, seeds, params):
     p_point_replace = params['p_point_replace']
     max_samples = params['max_samples']
     feature_names = params['feature_names']
+    optim_dict = params['optim_dict']
+    ohe_matrices = params['ohe_matrices']
+    timestamp = params['timestamp']
 
     max_samples = int(max_samples * n_samples)
 
@@ -71,13 +128,19 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight, seeds, params):
     for i in range(n_programs):
 
         random_state = check_random_state(seeds[i])
+        
+        parent_to_print = None
+        genome_to_print = {'method':None}
 
         if parents is None:
             program = None
             genome = None
         else:
+
+            
             method = random_state.uniform()
             parent, parent_index = _tournament()
+            parent_to_print = parent
 
             if method < method_probs[0]:
                 # crossover
@@ -113,6 +176,8 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight, seeds, params):
                 genome = {'method': 'Reproduction',
                           'parent_idx': parent_index,
                           'parent_nodes': []}
+            
+            genome_to_print = genome
 
         program = _Program(function_set=function_set,
                            arities=arities,
@@ -126,9 +191,13 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight, seeds, params):
                            parsimony_coefficient=parsimony_coefficient,
                            feature_names=feature_names,
                            random_state=random_state,
-                           program=program)
+                           program=program,
+                           optim_dict=optim_dict,
+                           timestamp=timestamp)
 
         program.parents = genome
+
+        print(f"{parent_to_print} -> {genome_to_print['method']} -> {program}")
 
         # Draw samples, using sample weights, and then fit
         if sample_weight is None:
@@ -143,11 +212,18 @@ def _parallel_evolve(n_programs, parents, X, y, sample_weight, seeds, params):
 
         curr_sample_weight[not_indices] = 0
         oob_sample_weight[indices] = 0
+        categorical_variables = list(ohe_matrices.keys())
+        cached = check_cached_results(cached_results, program,categorical_variables)
+        if cached is not None:
+            print(f"Retrieved score for {program}")
+            program.raw_fitness_ = cached
+        else:
+            program.raw_fitness_ = program.raw_fitness(X, y, curr_sample_weight, ohe_matrices=ohe_matrices)
+            save_to_cached_results(cached_results, program, categorical_variables, program.raw_fitness_)
 
-        program.raw_fitness_ = program.raw_fitness(X, y, curr_sample_weight)
         if max_samples < n_samples:
             # Calculate OOB fitness
-            program.oob_fitness_ = program.raw_fitness(X, y, oob_sample_weight)
+            program.oob_fitness_ = program.raw_fitness(X, y, oob_sample_weight, ohe_matrices=ohe_matrices)
 
         programs.append(program)
 
@@ -191,7 +267,9 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                  low_memory=False,
                  n_jobs=1,
                  verbose=0,
-                 random_state=None):
+                 random_state=None,
+                 optim_dict=None,
+                 categorical_variables=[]):
 
         self.population_size = population_size
         self.hall_of_fame = hall_of_fame
@@ -219,6 +297,15 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         self.n_jobs = n_jobs
         self.verbose = verbose
         self.random_state = random_state
+        self.optim_dict = optim_dict
+        self.categorical_variables = categorical_variables
+        self.manager = Manager()
+        # Create a lock using the manager
+        # self.lock = self.manager.Lock()
+        # Create a shared dictionary using the manager
+        self.cached_results = self.manager.dict()
+
+
 
     def _verbose_reporter(self, run_details=None):
         """A report of the progress of the evolution process.
@@ -261,6 +348,19 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                      oob_fitness,
                                      remaining_time))
 
+    def _create_ohe_matrices(self, X, categorical_variables, device):
+        ohe_matrices = {}
+        for k,v in categorical_variables.items():
+            submatrix = X[:,[k]]
+            submatrix = submatrix.astype('int')
+            # numbers = sorted(np.unique(submatrix))
+            numbers = list(range(v))
+            ohe = OneHotEncoder(categories=[numbers],sparse=False)
+            submatrix = ohe.fit_transform(submatrix)
+            ohe_matrices[k] = torch.from_numpy(submatrix).float().to(device)
+        
+        return ohe_matrices
+
     def fit(self, X, y, sample_weight=None):
         """Fit the Genetic Program according to X, y.
 
@@ -283,6 +383,8 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
         """
         random_state = check_random_state(self.random_state)
+
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H.%M.%S")
 
         # Check arrays
         if sample_weight is not None:
@@ -310,6 +412,8 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
 
         else:
             X, y = self._validate_data(X, y, y_numeric=True)
+
+        
 
         hall_of_fame = self.hall_of_fame
         if hall_of_fame is None:
@@ -425,6 +529,17 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         params['function_set'] = self._function_set
         params['arities'] = self._arities
         params['method_probs'] = self._method_probs
+        params['opt_dict'] = self.optim_dict
+        
+        device = torch.device(self.optim_dict['device'])
+        params['ohe_matrices'] = self._create_ohe_matrices(X,self.categorical_variables, device=device)
+        params['timestamp'] = timestamp
+
+        X = torch.from_numpy(np.array(X)).float().to(device)
+        y = torch.from_numpy(np.array(y)).float().to(device)
+        # print(params['ohe_matrices'])
+
+
 
         if not self.warm_start or not hasattr(self, '_programs'):
             # Free allocated memory, if any
@@ -473,7 +588,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 self.population_size, self.n_jobs)
             seeds = random_state.randint(MAX_INT, size=self.population_size)
 
-            population = Parallel(n_jobs=n_jobs,
+            population = Parallel(backend='threading',n_jobs=n_jobs,
                                   verbose=int(self.verbose > 1))(
                 delayed(_parallel_evolve)(n_programs[i],
                                           parents,
@@ -481,7 +596,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                           y,
                                           sample_weight,
                                           seeds[starts[i]:starts[i + 1]],
-                                          params)
+                                          params,self.cached_results)
                 for i in range(n_jobs))
 
             # Reduce, maintaining order across different n_jobs
@@ -527,6 +642,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
             self.run_details_['average_fitness'].append(np.mean(fitness))
             self.run_details_['best_length'].append(best_program.length_)
             self.run_details_['best_fitness'].append(best_program.raw_fitness_)
+            print(f"Best program: {best_program}")
             oob_fitness = np.nan
             if self.max_samples < 1.0:
                 oob_fitness = best_program.oob_fitness_
@@ -585,6 +701,12 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                 self._program = self._programs[-1][np.argmax(fitness)]
             else:
                 self._program = self._programs[-1][np.argmin(fitness)]
+            
+            # If the score was cached then we need to train the final model
+            if self._program.model is None:
+                self._program.raw_fitness(X,
+                                          y,
+                                          sample_weight,params['ohe_matrices'])
 
         return self
 
@@ -809,7 +931,9 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                  low_memory=False,
                  n_jobs=1,
                  verbose=0,
-                 random_state=None):
+                 random_state=None,
+                 optim_dict=None,
+                 categorical_variables=[]):
         super(SymbolicRegressor, self).__init__(
             population_size=population_size,
             generations=generations,
@@ -832,7 +956,9 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
             low_memory=low_memory,
             n_jobs=n_jobs,
             verbose=verbose,
-            random_state=random_state)
+            random_state=random_state,
+            optim_dict=optim_dict,
+            categorical_variables=categorical_variables)
 
     def __str__(self):
         """Overloads `print` output of the object to resemble a LISP tree."""
@@ -866,7 +992,9 @@ class SymbolicRegressor(BaseSymbolic, RegressorMixin):
                              'n_features is %s.'
                              % (self.n_features_in_, n_features))
 
-        y = self._program.execute(X)
+        ohe_matrices = self._create_ohe_matrices(X,self.categorical_variables,device=self.optim_dict['device'])
+        X = torch.from_numpy(np.array(X)).float().to(self.optim_dict['device'])
+        y = self._program.execute(X,ohe_matrices=ohe_matrices)
 
         return y
 
@@ -1099,7 +1227,9 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
                  low_memory=False,
                  n_jobs=1,
                  verbose=0,
-                 random_state=None):
+                 random_state=None,
+                 optim_dict=None,
+                 categorical_variables=None):
         super(SymbolicClassifier, self).__init__(
             population_size=population_size,
             generations=generations,
@@ -1124,7 +1254,9 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
             low_memory=low_memory,
             n_jobs=n_jobs,
             verbose=verbose,
-            random_state=random_state)
+            random_state=random_state,
+            optim_dict=optim_dict,
+            categorical_variables=categorical_variables)
 
     def __str__(self):
         """Overloads `print` output of the object to resemble a LISP tree."""
@@ -1161,8 +1293,8 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
                              'input. Model n_features is %s and input '
                              'n_features is %s.'
                              % (self.n_features_in_, n_features))
-
-        scores = self._program.execute(X)
+        ohe_matrices = self._create_ohe_matrices(X,self.categorical_variables,device=self.optim_dict['device'])
+        scores = self._program.execute(X,ohe_matrices=ohe_matrices)
         proba = self._transformer(scores)
         proba = np.vstack([1 - proba, proba]).T
         return proba
