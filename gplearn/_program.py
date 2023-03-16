@@ -14,9 +14,9 @@ import os
 
 import numpy as np
 from sklearn.utils.random import sample_without_replacement
-from sklearn.metrics import r2_score
+from sklearn.metrics import auc, r2_score, roc_auc_score
 
-from .functions import _Function
+from .functions import _Function, _sigmoid
 from .utils import check_random_state
 from .functions import _function_map
 
@@ -858,7 +858,7 @@ class _Program(object):
 
             logger = pl.loggers.TensorBoardLogger("tb_logs", name=f"{self.timestamp}/{new_id}")
             
-            trainer = pl.Trainer(default_root_dir='./lightning_logs',logger=logger,deterministic=True,devices=1,check_val_every_n_epoch=10,callbacks=[early_stopping,lr_monitor,checkpoint_callback],auto_lr_find=True,enable_model_summary = False,enable_progress_bar=False,log_every_n_steps=10,auto_scale_batch_size=False,accelerator=accelerator,max_epochs=self.optim_dict['max_n_epochs'])
+            trainer = pl.Trainer(default_root_dir='./lightning_logs',logger=logger,deterministic=True,devices=1,check_val_every_n_epoch=10,callbacks=[early_stopping,lr_monitor,checkpoint_callback],auto_lr_find=True,enable_model_summary = False,enable_progress_bar=True,log_every_n_steps=10,auto_scale_batch_size=False,accelerator=accelerator,max_epochs=self.optim_dict['max_n_epochs'])
             
             trainer.tune(model,train_dataloaders=train_dataloader)
             
@@ -875,6 +875,14 @@ class _Program(object):
             pred_dataloader = torch.utils.data.DataLoader(dataset, batch_size=self.optim_dict['batch_size'], shuffle=False, num_workers=self.optim_dict['num_workers_dataloader'])
 
             y_pred = torch.concat(trainer.predict(model, pred_dataloader)).cpu().numpy()
+
+            if 'keep_models' in self.optim_dict.keys():
+                keep_the_model = self.optim_dict['keep_models']
+            else:
+                keep_the_model = False
+            if not keep_the_model:
+                # Delete the model
+                os.remove(f"checkpoints/{self.timestamp}/{new_id}-best_val_loss.ckpt")
       
             
             # return val_loss
@@ -884,7 +892,11 @@ class _Program(object):
 
         y_numpy = y.cpu().numpy()
         raw_fitness = self.metric(y_numpy, y_pred, sample_weight)
-        r2 = r2_score(y_numpy, y_pred)
+        if self.optim_dict['task'] == 'regression':
+            r2 = r2_score(y_numpy, y_pred)
+        else:
+            logits = _sigmoid(y_pred)
+            r2 = roc_auc_score(y_numpy,logits)
         print(f"{self} | raw_fitness: {raw_fitness}")
 
         new_row = pd.DataFrame({"id":[new_id],"equation":[str(self)],"raw_fitness":[raw_fitness],"r2":[r2]})

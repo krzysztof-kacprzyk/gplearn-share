@@ -1295,7 +1295,10 @@ class SymbolicClassifier(BaseSymbolic, ClassifierMixin):
                              'input. Model n_features is %s and input '
                              'n_features is %s.'
                              % (self.n_features_in_, n_features))
+        
         ohe_matrices = self._create_ohe_matrices(X,self.categorical_variables,device=self.optim_dict['device'])
+        X = torch.from_numpy(np.array(X)).float().to(self.optim_dict['device'])
+
         scores = self._program.execute(X,ohe_matrices=ohe_matrices)
         proba = self._transformer(scores)
         proba = np.vstack([1 - proba, proba]).T
