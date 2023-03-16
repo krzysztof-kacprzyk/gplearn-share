@@ -10,9 +10,11 @@ computer program. It is used for creating and evolving programs used in the
 # License: BSD 3 clause
 
 from copy import copy
+import os
 
 import numpy as np
 from sklearn.utils.random import sample_without_replacement
+from sklearn.metrics import r2_score
 
 from .functions import _Function
 from .utils import check_random_state
@@ -32,6 +34,8 @@ import time
 from datetime import datetime
 
 import matplotlib.pyplot as plt
+
+import pandas as pd
 
 class _Program(object):
 
@@ -790,6 +794,18 @@ class _Program(object):
             The raw fitness of the program.
 
         """
+
+        # Check if the file checkpoints/{self.timestamp}/dictionary.csv exists
+        if os.path.isfile(f"checkpoints/{self.timestamp}/dictionary.csv"):
+            dictionary = pd.read_csv(f"checkpoints/{self.timestamp}/dictionary.csv",index_col=False)
+            new_id = dictionary['id'].max() + 1
+        else:
+            # Create a directory for the checkpoints
+            os.makedirs(f"checkpoints/{self.timestamp}")
+            dictionary = pd.DataFrame(columns=['id','equation','raw_fitness','r2'])
+            new_id = 0
+        
+
         if not self.is_fitting_necessary(ohe_matrices.keys()):
             y_pred = self.execute(X)
         else: # You need to do training
@@ -828,16 +844,19 @@ class _Program(object):
             # torch.set_float32_matmul_precision("medium")
             early_stopping = pl.callbacks.EarlyStopping('val_loss',patience=10,min_delta=self.optim_dict['tol'])
             lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='epoch')
+            
+           
+
             checkpoint_callback = pl.callbacks.ModelCheckpoint(
                                 monitor='val_loss',
                                 dirpath=f'checkpoints/{self.timestamp}',
-                                filename=f'{str(self)}-best_val_loss',
+                                filename=f'{new_id}-best_val_loss',
                                 save_top_k=1,
                                 mode='min',
                                 auto_insert_metric_name=True)
 
 
-            logger = pl.loggers.TensorBoardLogger("tb_logs", name=f"{self.timestamp}/{str(self)}")
+            logger = pl.loggers.TensorBoardLogger("tb_logs", name=f"{self.timestamp}/{new_id}")
             
             trainer = pl.Trainer(default_root_dir='./lightning_logs',logger=logger,deterministic=True,devices=1,check_val_every_n_epoch=10,callbacks=[early_stopping,lr_monitor,checkpoint_callback],auto_lr_find=True,enable_model_summary = False,enable_progress_bar=False,log_every_n_steps=10,auto_scale_batch_size=False,accelerator=accelerator,max_epochs=self.optim_dict['max_n_epochs'])
             
@@ -846,7 +865,7 @@ class _Program(object):
             trainer.fit(model=model,train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
 
             # Load the best model
-            model = LitModel.load_from_checkpoint(f"checkpoints/{self.timestamp}/{str(self)}-best_val_loss.ckpt", program=self)
+            model = LitModel.load_from_checkpoint(f"checkpoints/{self.timestamp}/{new_id}-best_val_loss.ckpt", program=self)
 
             self.model = model
 
@@ -863,8 +882,14 @@ class _Program(object):
         if self.transformer:
             y_pred = self.transformer(y_pred)
 
-        raw_fitness = self.metric(y.cpu().numpy(), y_pred, sample_weight)
+        y_numpy = y.cpu().numpy()
+        raw_fitness = self.metric(y_numpy, y_pred, sample_weight)
+        r2 = r2_score(y_numpy, y_pred)
         print(f"{self} | raw_fitness: {raw_fitness}")
+
+        new_row = pd.DataFrame({"id":[new_id],"equation":[str(self)],"raw_fitness":[raw_fitness],"r2":[r2]})
+        dictionary = pd.concat([dictionary,new_row],ignore_index=True)
+        dictionary.to_csv(f"checkpoints/{self.timestamp}/dictionary.csv",index=False)
 
         return raw_fitness
 

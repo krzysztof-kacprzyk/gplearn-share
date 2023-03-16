@@ -196,7 +196,7 @@ class LitModel(pl.LightningModule):
 
     def evaluate_equation(self, X, ohe_matrices):
 
-        program = self.program_list
+        program = self.program_list # already has "padded" shapes
 
         shape_counter = 0
 
@@ -207,14 +207,22 @@ class LitModel(pl.LightningModule):
         ohe_matrices = {k:ohe_matrices[i] for i, k in enumerate(self.categorical_variables)}
         
         apply_stack = []
+        # apply_stack is a stack. Each element is a list where the first element is function tuple and the rest are arguments
+        # the function tuple consists of the index of shape and the node itself
 
-        for node in program:
+        for i, node in enumerate(program):
             # print(node)
             # print(type(node))
             if isinstance(node, _Function):
                 apply_stack.append([(shape_counter,node)])
                 if node.name == 'shape':
-                    shape_counter += 1
+                    next_node = self.program_list[i+1] 
+                    if isinstance(next_node, int):
+                        if next_node not in self.categorical_variables:
+                            shape_counter += 1
+                    else:
+                        shape_counter += 1
+                    
             else:
                 apply_stack[-1].append(node)
             
@@ -226,7 +234,7 @@ class LitModel(pl.LightningModule):
                              else t for t in apply_stack[-1][1:]]
                 if function.name == 'shape':
                     # Check if the argument is a categorical variable
-                    raw_arg = apply_stack[-1][1]
+                    raw_arg = apply_stack[-1][1] # this is the index of the variable
                     if isinstance(raw_arg, int):
                         if raw_arg in self.categorical_variables:
                             # Categorical

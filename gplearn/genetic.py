@@ -86,6 +86,7 @@ def save_to_cached_results(cached_results, program, categorical_variables, score
     hashable = tuple(new_program_list)
     cached_results[hashable] = score
     print(len(cached_results))
+    print(f"Min error so far: {min(cached_results.items(),key=lambda x: x[1])[1]}")
     # print(id(cached_results))
         
 
@@ -385,6 +386,7 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
         random_state = check_random_state(self.random_state)
 
         timestamp = datetime.now().strftime("%Y-%m-%dT%H.%M.%S")
+        self.timestamp = timestamp
 
         # Check arrays
         if sample_weight is not None:
