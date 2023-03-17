@@ -194,9 +194,11 @@ class LitModel(pl.LightningModule):
     #     batch_ohe = batch[1:]
     #     return self.evaluate_equation(batch_X, batch_ohe)
 
-    def evaluate_equation(self, X, ohe_matrices):
+    def evaluate_equation(self, X, ohe_matrices, return_shape_ranges=False):
 
         program = self.program_list # already has "padded" shapes
+
+        shape_ranges = {}
 
         shape_counter = 0
 
@@ -242,9 +244,13 @@ class LitModel(pl.LightningModule):
                         else:
                             # Not categorical
                             intermediate_result = self.shape_functions[index](terminals[0]).flatten().float()
+                            if return_shape_ranges:
+                                shape_ranges[index] = (torch.min(terminals[0]).item(), torch.max(terminals[0]).item())
                     else:
                         # Not categorical
                         intermediate_result = self.shape_functions[index](terminals[0]).flatten().float()
+                        if return_shape_ranges:
+                            shape_ranges[index] = (torch.min(terminals[0]).item(), torch.max(terminals[0]).item())
                 else:
                     function = torch_functions[function.name]
                     intermediate_result = function(*terminals).float()
@@ -253,6 +259,8 @@ class LitModel(pl.LightningModule):
                     apply_stack.pop()
                     apply_stack[-1].append(intermediate_result)
                 else:
+                    if return_shape_ranges:
+                        return shape_ranges
                     return intermediate_result
 
 

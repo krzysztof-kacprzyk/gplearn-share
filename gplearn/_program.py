@@ -561,7 +561,101 @@ class _Program(object):
                 plt.plot(t.numpy(),y.numpy())
                 plt.show()
 
+    def plot_shape_functions_given_ranges(self, shape_arg_ranges, steps=1000):
 
+        shapes = self.model.shape_functions
+
+        for i, shape in enumerate(shapes):
+            t = torch.linspace(shape_arg_ranges[i][0],shape_arg_ranges[i][1],steps)
+            shape.to(torch.device('cpu'))
+            with torch.no_grad():
+                y = shape(t).flatten()
+                plt.plot(t.numpy(),y.numpy())
+                plt.show()
+
+
+    # def plot_shape_functions_based_on_data(self, data, steps=1000):
+
+    #     if self.keys is None:
+    #         self.keys = []
+        
+    #     if self.is_fitting_necessary(self.keys):
+    #         if self.model is None:
+    #             raise ValueError("The equation was not fitted. Call raw_fitness function")
+    #     else:
+    #         print("No shape functions to plot")
+    #         return
+
+        
+    #     program = self.model.program_list # this one contains the shape functions before categorical variables
+
+    #     # No need to deal with single node as the model requires fitting, so it has at least two nodes
+        
+    #     stack = []
+
+    #     shape_counter = 0
+    #     shape_ranges = {}
+
+    #     def get_variable_range(variable):
+    #         if variable in self.keys:
+    #             return variable
+    #         return (data[:,variable].min(),data[:,variable].max())
+        
+    #     def get_shape_range(shape_index, argument_range, steps=10000):
+    #         shape_function = self.model.shape_functions[shape_index]
+
+    #         shape_function.to(torch.device('cpu'))
+
+    #         t = torch.linspace(argument_range[0],argument_range[1],steps)
+            
+    #         pred = shape_function(t)
+    #         lower = torch.min(pred).item()
+    #         upper = torch.max(pred).item()
+
+    #         return (lower,upper)
+
+    #     def get_categorical_range(categorical_variable):
+    #         weights = self.model.cat_shape_functions[str(categorical_variable)]
+    #         lower = torch.min(weights)
+    #         upper = torch.max(weights)
+    #         return (lower,upper)
+
+
+    #     for i, node in enumerate(program):
+    #         # print(node)
+    #         # print(type(node))
+    #         if isinstance(node, _Function):
+    #             stack.append([(shape_counter,node)])
+    #             if node.name == 'shape':
+    #                 next_node = self.program_list[i+1] 
+    #                 if isinstance(next_node, int):
+    #                     if next_node not in self.categorical_variables:
+    #                         shape_counter += 1
+    #                 else:
+    #                     shape_counter += 1
+                    
+    #         else: # it's a variable 
+    #             stack[-1].append(get_variable_range(node))
+
+    #         while stack[-1][0][1].arity == len(stack[-1][1:]):
+    #             f = stack[-1][0][1]
+    #             index = stack[-1][0][0]
+    #             if f.name == 'shape':
+    #                 if not isinstance(stack[-1][1],tuple):
+    #                     # If it's not a tuple, it's a categorical variable. It should be an integer
+    #                     intermediate_range = get_categorical_range(stack[-1][1])
+    #                 else:
+    #                     intermediate_range = get_shape_range(index,stack[-1][1])
+    #                     shape_ranges[index] = stack[-1][1]
+    #             else:
+    #                 intermediate_range = get_operator_range(f,stack[-1][1:])
+                
+    #             if len(stack) != 1:
+    #                 stack.pop()
+    #                 stack[-1].append(intermediate_range)
+    #             else:
+    #                 print(shape_ranges)
+    #                 return shape_ranges
 
 
     def export_graphviz(self, fade_nodes=None):
@@ -642,6 +736,22 @@ class _Program(object):
     def _length(self):
         """Calculates the number of functions and terminals in the program."""
         return len(self.program)
+    
+    def get_shape_ranges(self,X,ohe_matrices={}):
+
+        if self.is_fitting_necessary(ohe_matrices.keys()) :
+            if self.model is None:
+                raise ValueError("The model was not trained")
+            
+            ohe_matrices_list = [ohe_matrices[k] for k in self.keys]
+            with torch.no_grad():
+                shape_ranges = self.model.evaluate_equation(X,ohe_matrices_list,return_shape_ranges=True)
+
+            return shape_ranges
+        else:
+            print("No shape functions")
+            return {}
+
 
     def execute(self, X, ohe_matrices={}):
         """Execute the program according to X.

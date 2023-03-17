@@ -711,6 +711,25 @@ class BaseSymbolic(BaseEstimator, metaclass=ABCMeta):
                                           sample_weight,params['ohe_matrices'])
 
         return self
+    
+    def get_shape_ranges(self,X):
+        
+        if not hasattr(self, '_program'):
+            raise NotFittedError('SymbolicRegressor not fitted.')
+
+        X = check_array(X)
+        _, n_features = X.shape
+        if self.n_features_in_ != n_features:
+            raise ValueError('Number of features of the model must match the '
+                             'input. Model n_features is %s and input '
+                             'n_features is %s.'
+                             % (self.n_features_in_, n_features))
+
+        ohe_matrices = self._create_ohe_matrices(X,self.categorical_variables,device=self.optim_dict['device'])
+        X = torch.from_numpy(np.array(X)).float().to(self.optim_dict['device'])
+        shape_ranges = self._program.get_shape_ranges(X,ohe_matrices)
+        return shape_ranges
+
 
 
 class SymbolicRegressor(BaseSymbolic, RegressorMixin):
