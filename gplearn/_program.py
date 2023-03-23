@@ -561,17 +561,18 @@ class _Program(object):
                 plt.plot(t.numpy(),y.numpy())
                 plt.show()
 
-    def plot_shape_functions_given_ranges(self, shape_arg_ranges, steps=1000):
+    def plot_shape_functions_given_ranges(self, shape_arg_ranges, axs, steps=1000):
 
         shapes = self.model.shape_functions
+        # assert len(shapes) == len(axs)
 
         for i, shape in enumerate(shapes):
             t = torch.linspace(shape_arg_ranges[i][0],shape_arg_ranges[i][1],steps)
             shape.to(torch.device('cpu'))
             with torch.no_grad():
                 y = shape(t).flatten()
-                plt.plot(t.numpy(),y.numpy())
-                plt.show()
+                axs[i].plot(t.numpy(),y.numpy())
+                # plt.show()
 
 
     # def plot_shape_functions_based_on_data(self, data, steps=1000):
