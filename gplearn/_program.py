@@ -955,20 +955,31 @@ class _Program(object):
             early_stopping = pl.callbacks.EarlyStopping('val_loss',patience=10,min_delta=self.optim_dict['tol'])
             lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='epoch')
             
-           
+            early_stopping_val_loss = self.optim_dict.get('early_stopping_val_loss',True)
 
-            checkpoint_callback = pl.callbacks.ModelCheckpoint(
-                                monitor='val_loss',
-                                dirpath=f'checkpoints/{self.timestamp}',
-                                filename=f'{new_id}-best_val_loss',
-                                save_top_k=1,
-                                mode='min',
-                                auto_insert_metric_name=True)
+            if early_stopping_val_loss:
+                checkpoint_callback = pl.callbacks.ModelCheckpoint(
+                                    monitor='val_loss',
+                                    dirpath=f'checkpoints/{self.timestamp}',
+                                    filename=f'{new_id}-best_val_loss',
+                                    save_top_k=1,
+                                    mode='min',
+                                    auto_insert_metric_name=True)
+                callbacks = [early_stopping,lr_monitor,checkpoint_callback]
+            else:
+                checkpoint_callback = pl.callbacks.ModelCheckpoint(
+                                    monitor='train_loss',
+                                    dirpath=f'checkpoints/{self.timestamp}',
+                                    filename=f'{new_id}-best_val_loss',
+                                    save_top_k=1,
+                                    mode='min',
+                                    auto_insert_metric_name=True)
+                callbacks = [lr_monitor,checkpoint_callback]
 
 
             logger = pl.loggers.TensorBoardLogger("tb_logs", name=f"{self.timestamp}/{new_id}")
-            
-            trainer = pl.Trainer(default_root_dir='./lightning_logs',logger=logger,deterministic=True,devices=1,check_val_every_n_epoch=10,callbacks=[early_stopping,lr_monitor,checkpoint_callback],auto_lr_find=True,enable_model_summary = False,enable_progress_bar=True,log_every_n_steps=10,auto_scale_batch_size=False,accelerator=accelerator,max_epochs=self.optim_dict['max_n_epochs'])
+
+            trainer = pl.Trainer(default_root_dir='./lightning_logs',logger=logger,deterministic=True,devices=1,check_val_every_n_epoch=10,callbacks=callbacks,auto_lr_find=True,enable_model_summary = False,enable_progress_bar=False,log_every_n_steps=1,auto_scale_batch_size=False,accelerator=accelerator,max_epochs=self.optim_dict['max_n_epochs'])
             
             trainer.tune(model,train_dataloaders=train_dataloader)
             

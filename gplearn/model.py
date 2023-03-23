@@ -28,6 +28,8 @@ class ShapeNN(torch.nn.Module,ShapeFunction):
             activation = torch.nn.ReLU()
         elif activation_name == 'Sigmoid':
             activation = torch.nn.Sigmoid()
+        elif activation_name == 'LeakyReLU':
+            activation = torch.nn.LeakyReLU()
         elif activation_name == 'ELU':
             activation = torch.nn.ELU()
         self.batch_norm = torch.nn.BatchNorm1d(1)
