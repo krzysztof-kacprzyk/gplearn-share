@@ -905,20 +905,38 @@ class _Program(object):
             The raw fitness of the program.
 
         """
+        if 'checkpoint_folder' in self.optim_dict:
+            checkpoint_folder = os.path.join(self.optim_dict['checkpoint_folder'],self.timestamp)
+        else:
+            checkpoint_folder = os.path.join("checkpoints",self.timestamp)
+
+        if 'enable_progress_bar' in self.optim_dict:
+            enable_progress_bar = self.optim_dict['enable_progress_bar']
+        else:
+            enable_progress_bar = False
 
         # Check if the file checkpoints/{self.timestamp}/dictionary.csv exists
-        if os.path.isfile(f"checkpoints/{self.timestamp}/dictionary.csv"):
-            dictionary = pd.read_csv(f"checkpoints/{self.timestamp}/dictionary.csv",index_col=False)
+        if os.path.isfile(f"{checkpoint_folder}/dictionary.csv"):
+            dictionary = pd.read_csv(f"{checkpoint_folder}/dictionary.csv",index_col=False)
             new_id = dictionary['id'].max() + 1
         else:
             # Create a directory for the checkpoints
-            os.makedirs(f"checkpoints/{self.timestamp}")
+            os.makedirs(checkpoint_folder)
             dictionary = pd.DataFrame(columns=['id','equation','raw_fitness','r2'])
             new_id = 0
         
+        # Create train val split
+
+        # Create indices for train and val using numpy generator
+        gen = np.random.default_rng(self.optim_dict['seed'])
+        indices = np.arange(X.shape[0])
+        gen.shuffle(indices)
+        train_size = int(0.8 * X.shape[0])
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:]
 
         if not self.is_fitting_necessary(ohe_matrices.keys()):
-            y_pred = self.execute(X)
+            y_pred = self.execute(X[val_indices,:])
         else: # You need to do training
             
             # model = Model(self,self.optim_dict,seed=0)
@@ -942,10 +960,11 @@ class _Program(object):
             gen = torch.Generator()
             gen.manual_seed(self.optim_dict['seed'])
 
-            # Use random_split to divide the dataset
-            train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size], generator=gen)
-
-           
+            # Subsample using train and val indices
+            train_dataset = torch.utils.data.Subset(dataset,train_indices)
+            val_dataset = torch.utils.data.Subset(dataset,val_indices)
+        
+            # train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size], generator=gen)
 
             train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=self.optim_dict['batch_size'], shuffle=True, num_workers=self.optim_dict['num_workers_dataloader'],generator=gen)
             val_dataloader = torch.utils.data.DataLoader(val_dataset, batch_size=self.optim_dict['batch_size'], shuffle=False, num_workers=self.optim_dict['num_workers_dataloader'],generator=gen)
@@ -953,7 +972,10 @@ class _Program(object):
             accelerator = "gpu" if self.optim_dict['device'] == 'cuda' else 'cpu'
 
             # torch.set_float32_matmul_precision("medium")
-            early_stopping = pl.callbacks.EarlyStopping('val_loss',patience=10,min_delta=self.optim_dict['tol'])
+            patience = self.optim_dict.get('patience',10)
+            check_val_every_n_epoch = self.optim_dict.get('check_val_every_n_epoch',10)
+
+            early_stopping = pl.callbacks.EarlyStopping('val_loss',patience=patience,min_delta=self.optim_dict['tol'])
             lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval='epoch')
             
             early_stopping_val_loss = self.optim_dict.get('early_stopping_val_loss',True)
@@ -961,7 +983,7 @@ class _Program(object):
             if early_stopping_val_loss:
                 checkpoint_callback = pl.callbacks.ModelCheckpoint(
                                     monitor='val_loss',
-                                    dirpath=f'checkpoints/{self.timestamp}',
+                                    dirpath=checkpoint_folder,
                                     filename=f'{new_id}-best_val_loss',
                                     save_top_k=1,
                                     mode='min',
@@ -970,7 +992,7 @@ class _Program(object):
             else:
                 checkpoint_callback = pl.callbacks.ModelCheckpoint(
                                     monitor='train_loss',
-                                    dirpath=f'checkpoints/{self.timestamp}',
+                                    dirpath=checkpoint_folder,
                                     filename=f'{new_id}-best_val_loss',
                                     save_top_k=1,
                                     mode='min',
@@ -980,23 +1002,24 @@ class _Program(object):
 
             logger = pl.loggers.TensorBoardLogger("tb_logs", name=f"{self.timestamp}/{new_id}")
 
-            trainer = pl.Trainer(default_root_dir='./lightning_logs',logger=logger,deterministic=True,devices=1,check_val_every_n_epoch=10,callbacks=callbacks,auto_lr_find=True,enable_model_summary = False,enable_progress_bar=False,log_every_n_steps=1,auto_scale_batch_size=False,accelerator=accelerator,max_epochs=self.optim_dict['max_n_epochs'])
+
+            trainer = pl.Trainer(default_root_dir='./lightning_logs',logger=logger,deterministic=True,devices=1,check_val_every_n_epoch=check_val_every_n_epoch,callbacks=callbacks,auto_lr_find=True,enable_model_summary = False,enable_progress_bar=enable_progress_bar,log_every_n_steps=1,auto_scale_batch_size=False,accelerator=accelerator,max_epochs=self.optim_dict['max_n_epochs'])
             
             trainer.tune(model,train_dataloaders=train_dataloader)
             
             trainer.fit(model=model,train_dataloaders=train_dataloader, val_dataloaders=val_dataloader)
 
             # Load the best model
-            model = LitModel.load_from_checkpoint(f"checkpoints/{self.timestamp}/{new_id}-best_val_loss.ckpt", program=self)
+            model = LitModel.load_from_checkpoint(f"{checkpoint_folder}/{new_id}-best_val_loss.ckpt", program=self)
 
             self.model = model
 
             # val_loss = trainer.callback_metrics['val_loss'].item()
             # print(f"val loss: {val_loss}")
 
-            pred_dataloader = torch.utils.data.DataLoader(dataset, batch_size=self.optim_dict['batch_size'], shuffle=False, num_workers=self.optim_dict['num_workers_dataloader'])
+            # pred_dataloader = torch.utils.data.DataLoader(dataset, batch_size=self.optim_dict['batch_size'], shuffle=False, num_workers=self.optim_dict['num_workers_dataloader'])
 
-            y_pred = torch.concat(trainer.predict(model, pred_dataloader)).cpu().numpy()
+            y_pred = torch.concat(trainer.predict(model, val_dataloader)).cpu().numpy()
 
             if 'keep_models' in self.optim_dict.keys():
                 keep_the_model = self.optim_dict['keep_models']
@@ -1004,7 +1027,7 @@ class _Program(object):
                 keep_the_model = False
             if not keep_the_model:
                 # Delete the model
-                os.remove(f"checkpoints/{self.timestamp}/{new_id}-best_val_loss.ckpt")
+                os.remove(f"{checkpoint_folder}/{new_id}-best_val_loss.ckpt")
       
             
             # return val_loss
@@ -1013,6 +1036,9 @@ class _Program(object):
             y_pred = self.transformer(y_pred)
 
         y_numpy = y.cpu().numpy()
+        y_numpy = y_numpy[val_indices]
+        sample_weight = np.ones_like(y_numpy)
+
         raw_fitness = self.metric(y_numpy, y_pred, sample_weight)
         if self.optim_dict['task'] == 'regression':
             r2 = r2_score(y_numpy, y_pred)
@@ -1023,7 +1049,7 @@ class _Program(object):
 
         new_row = pd.DataFrame({"id":[new_id],"equation":[str(self)],"raw_fitness":[raw_fitness],"r2":[r2]})
         dictionary = pd.concat([dictionary,new_row],ignore_index=True)
-        dictionary.to_csv(f"checkpoints/{self.timestamp}/dictionary.csv",index=False)
+        dictionary.to_csv(f"{checkpoint_folder}/dictionary.csv",index=False)
 
         return raw_fitness
 

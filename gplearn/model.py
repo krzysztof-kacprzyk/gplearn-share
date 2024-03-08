@@ -165,9 +165,12 @@ class LitModel(pl.LightningModule):
       
 
     def configure_optimizers(self):
-
+        if 'weight_decay' not in self.optim_dict.keys():
+            weight_decay = 0.0
+        else:
+            weight_decay = self.optim_dict['weight_decay']
         if self.optim_dict['alg'] == 'adam':
-            optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+            optimizer = torch.optim.Adam(self.parameters(), lr=self.lr, weight_decay=weight_decay)
         elif self.optim_dict['alg'] == 'rmsprop':
             optimizer = torch.optim.RMSprop(self.parameters(),lr=self.lr)
 
