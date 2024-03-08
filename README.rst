@@ -1,3 +1,11 @@
+gplearn-share: modified version of gplearn for fitting Shape Arithmetic Expressions
+===================
+
+This is a modified version of gplearn, a genetic programming library for symbolic regression. The original gplearn library can be found `here <https://github.com/trevorstephens/gplearn>`_.
+This library constitutes a submodule of the original repository for the paper "Shape Arithmetic Expressions: Advancing Scientific Discovery Beyond Closed-form Equations for Symbolic Regression" that can be found `here <https://github.com/krzysztof-kacprzyk/SHAREs>`_.
+
+Below is the original README of gplearn.
+
 .. image:: https://img.shields.io/pypi/v/gplearn.svg
     :target: https://pypi.python.org/pypi/gplearn/
     :alt: Version
